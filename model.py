@@ -71,7 +71,8 @@ def get_all_args(use_argparse=True):
 ########## MODEL I/O ##########
 
 def get_checkpoint(args, sample_only):
-    model = Transformer(args)
+    model = MatFormer(args)
+
     model.to(args.device)
     print(f"Model #params: {sum(p.numel() for p in model.parameters())}")
 
@@ -232,6 +233,16 @@ class CrossAttention(nn.Module):
         y = self.c_proj(y)
         return y
 
+class MLP(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd)
+        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd)
+        self.act = NewGELU()
+
+    def forward(self, x):
+        return self.c_proj(self.act(self.c_fc(x)))
+
 class Block(nn.Module):
     """ an unassuming Transformer block """
 
@@ -240,24 +251,23 @@ class Block(nn.Module):
         self.has_cross_attn = has_cross_attn
         self.ln_1 = nn.LayerNorm(config.n_embd)
         self.attn = CausalSelfAttention(config)
+
         if has_cross_attn:
             self.ln_2 = nn.LayerNorm(config.n_embd_context)
             self.cross_attn = CrossAttention(config)
+
         self.ln_3 = nn.LayerNorm(config.n_embd)
-        self.mlp = nn.ModuleDict(dict(
-            c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd),
-            c_proj  = nn.Linear(4 * config.n_embd, config.n_embd),
-            act     = NewGELU(),
-        ))
-        m = self.mlp
-        self.mlpf = lambda x: m.c_proj(m.act(m.c_fc(x))) # MLP forward
+
+        self.mlp = MLP(config)
 
     def forward(self, x, context=None):
         x = x + self.attn(self.ln_1(x))
+
         if self.has_cross_attn:
             assert context is not None, 'Expected context'
             x = x + self.cross_attn(self.ln_2(x), context)
-        x = x + self.mlpf(self.ln_3(x))
+
+        x = x + self.mlp(self.ln_3(x))
         return x
 
 class Transformer(nn.Module):
@@ -313,3 +323,74 @@ class Transformer(nn.Module):
         if targets is not None:
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
         return logits, loss
+
+class ModifiedMLP(MLP):
+    def __init__(self, config, scale_factors):
+        super().__init__(config)
+        self.intermediate_size = 4 * config.n_embd
+        self.scale_factors = scale_factors
+        self.current_subset_hd = None
+
+    def configure_subnetwork(self, flag):
+        """Configure subnetwork size based on flag."""
+        hd = self.intermediate_size
+        if flag == 's':
+            scale = self.scale_factors[0]  # hd/8
+        elif flag == 'm':
+            scale = self.scale_factors[1]  # hd/4
+        elif flag == 'l':
+            scale = self.scale_factors[2]  # hd/2
+        else:
+            scale = self.scale_factors[3]  # hd
+
+        self.current_subset_hd = int(hd * scale)
+
+    def forward(self, x):
+        if self.current_subset_hd is None:
+            raise ValueError("Subnetwork size not configured. Call `configure_subnetwork` first.")
+
+        c_fc = self.c_fc.weight[:self.current_subset_hd]
+        c_proj = self.c_proj.weight[:, :self.current_subset_hd]
+        out = F.linear(
+            self.act(F.linear(x, c_fc)),
+            c_proj
+        )
+        return out
+
+class MatFormer(Transformer):
+    def __init__(self, config):
+        super().__init__(config)
+        scale_factors = [1/8, 1/4, 1/2, 1]  # s, m, l, xl
+
+        # Replace FFN in each layer with ModifiedFFN
+        for layer_idx in range(config.n_layer):
+            self.transformer.h[layer_idx].mlp = ModifiedMLP(config, scale_factors)
+
+    def configure_subnetwork(self, flag):
+        """Configure the subnetwork for all layers based on the flag."""
+        for layer_idx in range(len(self.transformer.h)):
+            self.transformer.h[layer_idx].mlp.configure_subnetwork(flag)
+
+    def count_trainable_parameters(self):
+        """
+        Calculates the number of *effective* trainable parameters
+        based on the current subnetwork size.
+        """
+        total_params = 0
+
+        for name, param in self.named_parameters():
+            if 'mlp' not in name and param.requires_grad:
+                total_params += param.numel()
+
+        for i in range(self.config.n_layer):
+            mlp = self.transformer.h[i].mlp
+            if mlp.current_subset_hd is None:
+                raise ValueError("Subnetwork size not configured.")
+
+            total_params += mlp.current_subset_hd * self.config.n_embd
+            total_params += mlp.c_fc.bias.numel()
+
+            total_params += self.config.n_embd * mlp.current_subset_hd
+            total_params += mlp.c_proj.bias.numel()
+
+        return total_params

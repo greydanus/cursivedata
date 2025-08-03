@@ -2,7 +2,7 @@
 
 ########## IMPORTS AND A FEW GLOBAL VARIABLES ##########
 
-import os, sys, time, getpass
+import os, sys, time, getpass, random
 from typing import Optional
 from dataclasses import dataclass
 
@@ -78,6 +78,9 @@ if __name__ == '__main__':
         batch = batch_loader.next()
         X, C, Y = [t.to(args.device) for t in batch]
 
+        flag = random.choice(['s', 'm', 'l', 'xl'])
+        model.configure_subnetwork(flag)
+
         # feed into the model
         logits, loss = model(X, C, Y)
 
@@ -119,4 +122,3 @@ if __name__ == '__main__':
             break
 
     wandb.finish()
-
